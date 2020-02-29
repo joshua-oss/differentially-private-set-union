@@ -1,3 +1,5 @@
 project/
 target/
 resources/data/
+.metals/
+.bloop/
