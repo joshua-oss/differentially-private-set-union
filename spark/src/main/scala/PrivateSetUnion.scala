@@ -1,12 +1,13 @@
 package psu
 
 import org.apache.spark.{SparkConf, SparkContext}
-//import org.apache.spark.SparkContext._
 import org.apache.spark.Partitioner
 import org.apache.spark.rdd.RDD
 import scala.util.hashing.MurmurHash3
 import scala.util.Random
-
+import scala.collection.mutable.HashMap
+import scala.collection.immutable.ListMap
+import scala.math
 
 case class UserBudget(user: User, budget: Float)
 
@@ -27,7 +28,87 @@ class WordUserPartitioner(partitions: Int) extends Partitioner {
       val k = key.asInstanceOf[UserWord]
       ((k.word % numPartitions) + numPartitions) % numPartitions
     }
-  }
+}
+
+object UserWordGroup {
+    def group(pairs: RDD[(User, Word)], numPartitions: Int) : RDD[(UserWord,Int)]= {
+        val uwParts = pairs.map{
+            case (user, word) => {
+                (UserWord(user, word), ((word % numPartitions) + numPartitions) % numPartitions)
+            }
+        }
+        
+        val uwCounts = pairs.map(p => (UserWord(p._1, p._2), 1)).reduceByKey(_ + _)
+
+        val uCounts = uwCounts.map(uw => (uw._1.user, 1)).reduceByKey(_ + _)
+
+
+        uwParts.repartitionAndSortWithinPartitions(new WordUserPartitioner(numPartitions))
+    }
+
+    def localCount(iter: Iterator[(UserWord, Word)], eps: Double, delta: Double, maxContrib: Int) : Iterator[(Word, Double)] = {
+        val alpha = 5.0
+        val l_param = 1.0 / eps
+        val l_rho = (1 to maxContrib + 1).map(t => 1.0 / t + (1.0 / eps) * math.log(1.0 / (2.0 * (1.0 - math.pow((1.0 - delta),(1.0 / t)))))).max
+        val gamma = l_rho + alpha * l_param
+        val user_budget = 1.0
+
+        val totals : HashMap[Int, Double] = new HashMap()
+
+        var lastUser = 0 : Int
+        var word = 0 : Int
+        
+        val gaps : HashMap[Int, Double] = new HashMap()
+
+        while (iter.hasNext) {
+            val record = iter.next
+            val thisUser = record._1.user
+            word = record._1.word
+
+            val wordTotal = if (totals.contains(word)) totals(word) else 0.0
+            if (wordTotal < gamma) {
+                gaps(word) = gamma - wordTotal
+            }
+
+            if (thisUser != lastUser) {
+                if (lastUser != 0) {
+                    // process the user's words
+                    var budget = user_budget
+                    var sorted = ListMap(gaps.toSeq.sortBy(_._2):_*)
+                    while (sorted.size > 0) {
+                        val size = sorted.size
+                        val (w, gap) = sorted.head
+                        val cost = gap * size
+                        if (cost <= budget) {
+                            sorted.foreach(entry => {
+                                val word = entry._1
+                                val curTotal = if (totals.contains(word)) totals(word) else 0.0
+                                totals(word) = curTotal + gap
+                            })
+                            sorted = sorted.tail.map(entry => (entry._1, entry._2 - gap))
+                            budget = budget - cost
+                        }
+                        else {
+                            sorted.foreach(entry => {
+                                val word = entry._1
+                                val curTotal = if (totals.contains(word)) totals(word) else 0.0
+                                totals(word) = curTotal + (budget / size )
+                            })
+                            sorted = sorted.empty
+                        }
+                    }
+                }
+                lastUser = thisUser
+                gaps.clear()
+            }
+        }
+
+        totals.filter(_._2 > l_rho).toIterator
+    }
+}
+
+
+
 
 object Top {
     def words(pairs: RDD[(WordLabel, Count)], n_records: Int) : Array[(WordLabel, Count)] = {
@@ -110,7 +191,7 @@ object Console {
         try {
 
             val delta_0 = 10
-            val n_parts = 10
+            val n_parts = 2
 
 
             val input = sc.textFile("resources/data/clean_askreddit.csv").map(line => line.toLowerCase)
@@ -124,22 +205,24 @@ object Console {
             //val parts = UserPartitions.part(sampled, n_parts)
             //val parts_count = parts.map(p => (p._2, 1)).reduceByKey(_ + _)
 
-            val groups = sampled.map{
-                case (user, word) => {
-                    (UserWord(user, word), word)
-                }
-            }.repartitionAndSortWithinPartitions(new WordUserPartitioner(n_parts))
+            val groups = UserWordGroup.group(sampled, n_parts)
+
+            val groupsCounted = groups.mapPartitions(part => UserWordGroup.localCount(part, 4.0, 10E-8, delta_0))
             
-            groups.saveAsTextFile("resources/streams/foo")
+            //groupsCounted.saveAsTextFile("resources/streams/foo")
+
+            val ngrams = groupsCounted.count()
 
             //Loader.writeCsv(parts_count, "wc.csv")
 
-            //println("-=-=-=-=-=-=-=-=-=-==-")
+            println("-=-=-=-=-=-=-=-=-=-==-")
+            println(s"Counted $ngrams ngrams")
+
             //top.foreach(println)
             //println(hist.count())
             //dict.take(10).foreach(println)
             //parts_count.foreach(println)
-            //println("-=-=-=-=-=-=-=-=-=-==-")
+            println("-=-=-=-=-=-=-=-=-=-==-")
         } finally {
             sc.stop()
         }
