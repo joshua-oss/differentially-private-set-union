@@ -35,38 +35,16 @@ class WordUserPartitioner(partitions: Int) extends Partitioner {
 }
 
 object UserWordGroup {
-    def group(pairs: RDD[(User, Word)], numParts: Int, budgetProportional : Boolean) : RDD[(UserWord, Budget)]= {
+    def group(pairs: RDD[(User, Word)], numParts: Int) : RDD[(UserWord, Count)]= {
 
-        val uwParts : RDD[(UserWordPart)] = pairs.map{
-            case (user, word) => {
-                (UserWordPart(user, word, ((word % numParts) + numParts) % numParts))
-            }
-        }
+        val uwCounts : RDD[(User, Count)] = pairs.map(p => (p._1, 1)).reduceByKey(_ + _)
+        val uwwCounts : RDD[(User, (Word, Count))] = pairs.join(uwCounts)
 
-
-        val upCounts : RDD[(UserPart, Count)] = uwParts.map(p => (UserPart(p.user, p.part), 1)).reduceByKey(_ + _)
-
-        val uCounts : RDD[(User, Count)] = upCounts.map(p => (p._1.user, p._2)).reduceByKey(_ + _)
-
-        val upuCounts : RDD[(User, ((UserPart, Count), Count ))] = upCounts.map(upc => (upc._1.user, upc)).join(uCounts)
-
-        val upBudgets : RDD[(UserPart, Budget)] = upuCounts.map(p => (p._2._1._1,(p._2._1._2.toFloat / p._2._2.toFloat) ))
-
-        
-        val uwpupBudgets : RDD[(UserPart, ((UserWordPart), (Budget)))] = uwParts.map(p => (UserPart(p.user, p.part), p)).join(upBudgets)
-
-
-        if (budgetProportional) {
-            val augmented = uwpupBudgets.map(p => (UserWord(p._2._1.user, p._2._1.word) , p._2._2))
-            augmented.repartitionAndSortWithinPartitions(new WordUserPartitioner(numParts))
-        } else {
-            val augmented = uwParts.map(p => (UserWord(p.user, p.word), 1.0.toFloat / numParts.toFloat))
-            augmented.repartitionAndSortWithinPartitions(new WordUserPartitioner(numParts))
-        }
-
+        val augmented = uwwCounts.map(p => (UserWord(p._1, p._2._1), p._2._2))
+        augmented.repartitionAndSortWithinPartitions(new WordUserPartitioner(numParts))
     }
 
-    def localCount(iter: Iterator[(UserWord, Float)], eps: Float, delta: Float, maxContrib: Int) : Iterator[(Word, Float)] = {
+    def localCount(iter: Iterator[(UserWord, Count)], eps: Float, delta: Float, maxContrib: Int) : Iterator[(Word, Float)] = {
         val alpha = 5.0f
         val l_param = 1.0f / eps
         val l_rho = (1 to maxContrib + 1).map(t => 1.0f / t + (1.0f / eps) * math.log(1.0f / (2.0f * (1.0f - math.pow((1.0f - delta),(1.0f / t)))))).max.toFloat
@@ -76,7 +54,7 @@ object UserWordGroup {
 
         var lastUser = 0 : Int
         var word = 0 : Int
-        var user_budget = 1.0.toFloat
+        var user_word_count = 1.0.toFloat
         
         val gaps : HashMap[Int, Float] = new HashMap()
 
@@ -84,7 +62,7 @@ object UserWordGroup {
             val record = iter.next
             val thisUser = record._1.user
             word = record._1.word
-            user_budget = record._2
+            user_word_count = record._2.toFloat
 
             val wordTotal = if (totals.contains(word)) totals(word) else 0.0.toFloat
             if (wordTotal < gamma) {
@@ -94,7 +72,7 @@ object UserWordGroup {
             if (thisUser != lastUser) {
                 if (lastUser != 0) {
                     // process the user's words
-                    var budget = user_budget
+                    var budget = gaps.size.toFloat / user_word_count
                     var sorted = ListMap(gaps.toSeq.sortBy(_._2):_*)
                     while (sorted.size > 0) {
                         val size = sorted.size
@@ -134,29 +112,6 @@ object UserWordGroup {
 object Top {
     def words(pairs: RDD[(WordLabel, Count)], n_records: Int) : Array[(WordLabel, Count)] = {
         pairs.takeOrdered(n_records)(Ordering[Int].reverse.on(_._2))
-    }
-}
-object Histogram {
-    def count(pairs: RDD[(User, Word)]) : RDD[(Word, Count)] = {
-        pairs.map{
-            case (user, word) => {
-                (word, 1)
-            }
-        }.reduceByKey(_ + _)
-    }
-}
-
-object UserParts {
-    // report count of Parts that user will be in, if words are Parted
-    // in n_parts Parts
-    def part(pairs: RDD[(User, Word)], n_parts : Int) : RDD[(User, Count)] = {
-        pairs.map{
-            case (user, word) => {
-                // scala has signed modulus
-                val Part = ((word % n_parts) + n_parts) % n_parts
-                (user, Part)
-            }
-        }.distinct().map(p => (p._1, 1)).reduceByKey(_ + _)
     }
 }
 
@@ -211,22 +166,16 @@ object Console {
         val sc = new SparkContext("local", "SetUnion", new SparkConf())
         try {
 
-            val delta_0 = 100
-            val n_parts = 1
+            val delta_0 = 200
+            val n_parts = 2
 
 
             val input = sc.textFile("resources/data/clean_askreddit.csv").map(line => line.toLowerCase)
             val tokens = Tokenizer.tokenize(input)
             val hashes = Murmurizer.hash(tokens)
             val sampled = Reservoir.sample(hashes, delta_0)
-            val hist = Histogram.count(sampled)
-            //val dict = Dictionary.lookup(hist, tokens.map(_._2))
-            //val top = Top.words(dict, 10)
 
-            //val parts = UserParts.part(sampled, n_parts)
-            //val parts_count = parts.map(p => (p._2, 1)).reduceByKey(_ + _)
-
-            val groups = UserWordGroup.group(sampled, n_parts, true)
+            val groups = UserWordGroup.group(sampled, n_parts)
 
             val groupsCounted = groups.mapPartitions(part => UserWordGroup.localCount(part, 4.0.toFloat, 10E-8.toFloat, delta_0))
             
@@ -238,11 +187,6 @@ object Console {
 
             println("-=-=-=-=-=-=-=-=-=-==-")
             println(s"Counted $ngrams ngrams")
-
-            //top.foreach(println)
-            //println(hist.count())
-            //dict.take(10).foreach(println)
-            //parts_count.foreach(println)
             println("-=-=-=-=-=-=-=-=-=-==-")
         } finally {
             sc.stop()
